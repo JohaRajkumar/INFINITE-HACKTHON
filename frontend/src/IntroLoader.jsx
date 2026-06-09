@@ -35,7 +35,7 @@ export default function IntroLoader({ onComplete }) {
       clearTimeout(completeTimer);
       clearTimeout(exitTimer);
     };
-  }, [onComplete]);
+  }, []); // Run only once on mount to avoid re-triggering on App re-renders
 
   return <IntroTransition stage={stage} />;
 }

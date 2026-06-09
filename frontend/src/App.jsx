@@ -402,7 +402,36 @@ function App() {
           addAgentLog(`ALERT: Step ${data.step.step_number} execution BLOCKED. Operator approval signature required.`, 'warning');
           triggerToast('Action blocked: Risky command detected.', 'error');
         }
-      } else if (data.status === 'RUNNING') {
+      } else if (data.status === 'RECOVERING') {
+        const step = data.step;
+        setConsoleLogs(prev => [
+          ...prev,
+          { type: 'system', text: `[SYSTEM] Automated Step ${step.step_number}: ${step.description}` },
+          { type: 'input', text: step.command },
+          { type: 'error', text: `[FAILURE DETECTED] Fetching correct command via MCP...` }
+        ]);
+        addAgentLog(`Step ${step.step_number} failed. MCP auto-recovery protocol initiated.`, 'danger');
+        
+      } else if (data.status === 'RECOVERED') {
+        const step = data.step;
+        setConsoleLogs(prev => [
+          ...prev,
+          { type: 'system', text: `[MCP RECOVERY] Command successfully swapped!` },
+          { type: 'input', text: step.command },
+          { type: 'output', text: step.output || 'Recovered.' }
+        ]);
+        addAgentLog(`Step ${step.step_number} successfully auto-recovered via MCP.`, 'check');
+        
+      } else if (data.status === 'FAILED') {
+        const step = data.step;
+        setConsoleLogs(prev => [
+          ...prev,
+          { type: 'system', text: `[SYSTEM] Automated Step ${step.step_number}: ${step.description}` },
+          { type: 'input', text: step.command },
+          { type: 'error', text: `[FAILURE DETECTED] Step execution failed.` }
+        ]);
+        addAgentLog(`Step ${step.step_number} failed.`, 'danger');
+      } else if (data.status === 'SUCCESS') {
         const step = data.step;
         const logLines = [];
         logLines.push({ type: 'system', text: `[SYSTEM] Automated Step ${step.step_number}: ${step.description}` });
@@ -809,7 +838,10 @@ function App() {
                           Runbook: <strong>{currentRun.run.name}</strong> • ID: {currentRun.run.id} • Status: <span className={`badge ${currentRun.run.status.toLowerCase()}`}>{currentRun.run.status}</span>
                         </p>
                       </div>
-                      <button className="btn-sync" onClick={() => loadRunDetails(currentRunId)}>
+                      <button className="btn-sync" onClick={() => {
+                        loadRunDetails(currentRunId);
+                        triggerToast('Status successfully synchronized with backend.', 'success');
+                      }}>
                         Sync Status
                       </button>
                     </div>
@@ -1133,20 +1165,29 @@ function App() {
                                 justifyContent: 'center',
                                 fontSize: '11px',
                                 fontWeight: 700,
-                                background: step.status === 'SUCCESS' ? 'var(--color-success-glow)' : (step.status === 'FAILED' ? 'var(--color-danger-glow)' : 'rgba(255, 255, 255, 0.05)'),
-                                color: step.status === 'SUCCESS' ? 'var(--color-success)' : (step.status === 'FAILED' ? 'var(--color-danger)' : 'var(--color-text-secondary)'),
+                                background: step.status === 'SUCCESS' ? 'var(--color-success-glow)' : (step.status === 'FAILED' || step.status === 'FAILED_NEEDS_MCP' ? 'var(--color-danger-glow)' : 'rgba(255, 255, 255, 0.05)'),
+                                color: step.status === 'SUCCESS' ? 'var(--color-success)' : (step.status === 'FAILED' || step.status === 'FAILED_NEEDS_MCP' ? 'var(--color-danger)' : 'var(--color-text-secondary)'),
                                 border: '1px solid currentColor'
                               }}>
                                 {step.step_number}
                               </div>
                               <div>
                                 <span style={{ fontWeight: 600 }}>{step.description}</span>
-                                {step.command && <code style={{ marginLeft: '12px', fontSize: '12px', color: 'var(--color-primary-hover)' }}>{step.command}</code>}
+                                {step.command && !step.corrected_command && <code style={{ marginLeft: '12px', fontSize: '12px', color: 'var(--color-primary-hover)' }}>{step.command}</code>}
+                                {step.command && step.corrected_command && (
+                                  <>
+                                    <code style={{ marginLeft: '12px', fontSize: '12px', color: 'var(--color-danger)', textDecoration: 'line-through' }}>{step.command}</code>
+                                    <span style={{ margin: '0 8px', color: 'var(--color-text-muted)', fontSize: '12px' }}>→</span>
+                                    <code style={{ fontSize: '12px', color: 'var(--color-success)' }}>{step.corrected_command}</code>
+                                  </>
+                                )}
                               </div>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                               {step.command && <span className={`step-risk ${step.risk_level.toLowerCase()}`} style={{ marginRight: '8px' }}>{step.risk_level}</span>}
-                              <span className={`badge ${step.status.toLowerCase()}`}>{step.status}</span>
+                              <span className={`badge ${step.status === 'FAILED_NEEDS_MCP' ? 'failed' : step.status.toLowerCase()}`}>
+                                {step.status === 'FAILED_NEEDS_MCP' ? 'FAILED' : step.status}
+                              </span>
                               <svg 
                                 width="16" 
                                 height="16" 

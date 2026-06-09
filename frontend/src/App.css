@@ -693,6 +693,14 @@ body::after {
   animation: warning-pulse-light 1.5s infinite;
 }
 
+.step-node.recovering .step-circle {
+  background: rgba(139, 92, 246, 0.15);
+  border-color: #8b5cf6;
+  color: #8b5cf6;
+  box-shadow: 0 0 8px rgba(139, 92, 246, 0.4);
+  animation: pulse-border-light 1s infinite alternate;
+}
+
 .step-node.running .step-circle {
   background: var(--color-primary-glow);
   border-color: var(--color-primary);

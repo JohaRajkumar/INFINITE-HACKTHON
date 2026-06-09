@@ -194,11 +194,10 @@ def execute_next_step(run_id):
             run.started_at = datetime.utcnow()
             session.commit()
             send_discord_notification("RUN_START", f"Runbook '{run.name}' (ID: {run.id}) is now running.")
-            
-        # Find next pending/waiting step
+                   # Find next pending/waiting/recovering step
         next_step = session.query(RunbookStep).filter(
             RunbookStep.run_id == run_id,
-            RunbookStep.status.in_(['PENDING', 'WAITING_APPROVAL'])
+            RunbookStep.status.in_(['PENDING', 'WAITING_APPROVAL', 'RECOVERING', 'FAILED_NEEDS_MCP'])
         ).order_by(RunbookStep.step_number).first()
         
         if not next_step:
@@ -214,6 +213,53 @@ def execute_next_step(run_id):
                 "warning": generate_warning(next_step.command, next_step.risk_level)
             })
 
+        # Phase 1.5 of Auto-Remediation: Call MCP synchronously, but return so UI sees RECOVERING
+        if next_step.status == 'FAILED_NEEDS_MCP':
+            print(f"Detecting failure... invoking MCP to fetch correction for: {next_step.command}")
+            try:
+                from mcp_client import get_corrected_command_sync
+                corrected_command = get_corrected_command_sync(
+                    next_step.command, 
+                    next_step.step_type or 'SHELL', 
+                    next_step.output
+                )
+                print(f"MCP returned corrected command: {corrected_command}")
+                next_step.corrected_command = corrected_command
+                next_step.status = 'RECOVERING'
+            except Exception as e:
+                print(f"MCP auto-recovery fetch failed: {e}")
+                next_step.status = 'FAILED'
+                
+            session.commit()
+            return jsonify({
+                "status": "RECOVERING" if next_step.status == 'RECOVERING' else "FAILED",
+                "message": "Fetched recovery command via MCP.",
+                "step": next_step.to_dict()
+            })
+
+        # Phase 2 of Auto-Remediation: Execute the corrected command
+        if next_step.status == 'RECOVERING':
+            print(f"Executing MCP recovered command: {next_step.corrected_command}")
+            
+            # Execute the corrected command directly without erasing the original broken command from history
+            retry_success, retry_output = execute_step(next_step.corrected_command, next_step.step_type or 'SHELL')
+            
+            # Update outputs to reflect recovery
+            next_step.output = f"[MCP AUTO-RECOVERY SUCCESS]\n{retry_output}" if retry_success else f"[MCP AUTO-RECOVERY FAILED]\n{retry_output}"
+            
+            if retry_success:
+                next_step.status = 'SUCCESS'
+                run.errors_count -= 1 # Remove the error count since we successfully recovered
+            else:
+                next_step.status = 'FAILED'
+                
+            session.commit()
+            return jsonify({
+                "status": "RECOVERED",
+                "message": f"Step {next_step.step_number} recovered via MCP.",
+                "step": next_step.to_dict()
+            })
+
         # Automatically execute informational steps
         if not next_step.has_command or not next_step.command:
             next_step.status = 'SUCCESS'
@@ -221,12 +267,12 @@ def execute_next_step(run_id):
             next_step.output = "Informational step. No command executed."
             run.executed_steps += 1
             session.commit()
-            
-            # Recurse inside the active session context
             return execute_next_step(run_id)
 
-        # Check safety level
-        is_safe = next_step.risk_level == 'SAFE' and is_command_allowed(next_step.command)
+        # Check safety level (Binary allowlist only applies to pure SHELL commands)
+        is_safe = next_step.risk_level == 'SAFE'
+        if next_step.step_type == 'SHELL' or not next_step.step_type:
+            is_safe = is_safe and is_command_allowed(next_step.command)
         
         if is_safe:
             next_step.status = 'RUNNING'
@@ -236,31 +282,35 @@ def execute_next_step(run_id):
             success, output = execute_step(next_step.command, next_step.step_type or 'SHELL')
 
             next_step.output = output
-            next_step.status = 'SUCCESS' if success else 'FAILED'
             next_step.executed_at = datetime.utcnow()
-            
-            run.executed_steps += 1
+
             if not success:
+                # Intercept failure for auto-remediation via MCP protocol (Phase 1)
+                # We set it to a special failure state so the UI can render the failure FIRST
+                next_step.status = 'FAILED_NEEDS_MCP'
                 run.errors_count += 1
-                try:
-                    correction_result = suggest_corrected_command(next_step.command, next_step.step_type or 'SHELL', output)
-                    next_step.corrected_command = correction_result
-                except Exception as e:
-                    print(f"Error suggesting corrected command: {e}")
+                session.commit()
+                return jsonify({
+                    "status": "FAILED",
+                    "message": f"Step {next_step.step_number} failed. Queued for MCP recovery.",
+                    "step": next_step.to_dict()
+                })
+            else:
+                next_step.status = 'SUCCESS'
+                run.executed_steps += 1
+                session.commit()
                 
-            session.commit()
-            
-            emoji_status = "SUCCESS" if success else "FAILURE"
-            send_discord_notification(
-                f"STEP_{emoji_status}", 
-                f"Step {next_step.step_number}: '{next_step.command}' ({emoji_status})"
-            )
-            
-            return jsonify({
-                "status": "RUNNING",
-                "message": f"Executed step {next_step.step_number} automatically.",
-                "step": next_step.to_dict()
-            })
+                emoji_status = "SUCCESS"
+                send_discord_notification(
+                    f"STEP_{emoji_status}", 
+                    f"Step {next_step.step_number}: '{next_step.command}' ({emoji_status})"
+                )
+                
+                return jsonify({
+                    "status": "RUNNING",
+                    "message": f"Step {next_step.step_number} executed successfully.",
+                    "step": next_step.to_dict()
+                })
         else:
             # Block and require approval
             next_step.status = 'WAITING_APPROVAL'
@@ -388,10 +438,11 @@ def finalize_run(session, run):
     """
     run.completed_at = datetime.utcnow()
     
-    if run.errors_count > 0:
-        run.status = 'FAILED'
-    elif run.skipped_steps > 0:
+    # If any steps were skipped, we consider the run PARTIAL regardless of errors
+    if run.skipped_steps > 0:
         run.status = 'PARTIAL'
+    elif run.errors_count > 0:
+        run.status = 'FAILED'
     else:
         run.status = 'COMPLETED'
         
@@ -427,6 +478,32 @@ def finalize_run(session, run):
 @app.errorhandler(400)
 def bad_request(e):
     return jsonify({"error": "Bad request", "detail": str(e)}), 400
+
+@app.route('/api/run/<int:run_id>/cancel', methods=['POST'])
+def cancel_run(run_id):
+    """
+    Halts the runbook explicitly. Marks pending steps as skipped and finalizes the run as PARTIAL.
+    """
+    session = get_db()
+    try:
+        run = session.get(RunbookRun, run_id)
+        if not run:
+            return jsonify({"error": "Run not found"}), 404
+            
+        pending_steps = session.query(RunbookStep).filter(
+            RunbookStep.run_id == run_id,
+            RunbookStep.status.in_(['PENDING', 'WAITING_APPROVAL', 'RECOVERING'])
+        ).all()
+        
+        for step in pending_steps:
+            step.status = 'DENIED'
+            step.output = "[Pipeline auto-execution manually halted by operator]"
+            run.skipped_steps += 1
+            
+        session.commit()
+        return finalize_run(session, run)
+    finally:
+        session.close()
 
 @app.errorhandler(404)
 def not_found(e):
