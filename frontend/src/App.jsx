@@ -1,10 +1,20 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import './App.css';
 import IntroLoader from './IntroLoader';
 
 const API_BASE = 'http://localhost:5050';
 
+const escapeCSV = (val) => {
+  if (val === null || val === undefined) return '';
+  let str = String(val);
+  if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+    str = `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+};
+
 function App() {
+  const toastCounterRef = useRef(0);
   const [showIntro, setShowIntro] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
   
@@ -18,6 +28,7 @@ function App() {
   const [uploadText, setUploadText] = useState('');
   const [uploadFile, setUploadFile] = useState(null);
   const [isBackendConnected, setIsBackendConnected] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
   // Live Runner state
@@ -71,131 +82,15 @@ function App() {
 
   // Toast helper
   const triggerToast = (message, type = 'info') => {
-    const id = Date.now() + Math.random().toString(36).substr(2, 9);
+    toastCounterRef.current += 1;
+    const id = `toast-${toastCounterRef.current}`;
     setToasts(prev => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
     }, 4000);
   };
 
-  // Restore run state from localStorage on startup — validate the run still exists first
-  useEffect(() => {
-    const savedRunId = localStorage.getItem('antigravity_current_run_id');
-    if (savedRunId) {
-      const runId = parseInt(savedRunId, 10);
-      // Validate the run still exists before restoring
-      fetch(`${API_BASE}/api/run/${runId}/status`)
-        .then(res => {
-          if (!res.ok) throw new Error('Run not found');
-          return res.json();
-        })
-        .then(data => {
-          setCurrentRunId(runId);
-          setCurrentRun(data);
-          setActiveTab('runner');
-          setConsoleLogs([{ type: 'system', text: `[SYSTEM] Restored runner state from last session (Run ID: ${runId}).` }]);
-          triggerToast('Restored last active session.', 'info');
-        })
-        .catch(() => {
-          // Run no longer exists — clear stale localStorage silently
-          localStorage.removeItem('antigravity_current_run_id');
-          setActiveTab('dashboard');
-        });
-    }
-  }, []);
 
-  // Sync currentRunId to localStorage
-  useEffect(() => {
-    if (currentRunId) {
-      localStorage.setItem('antigravity_current_run_id', currentRunId);
-    } else {
-      localStorage.removeItem('antigravity_current_run_id');
-    }
-  }, [currentRunId]);
-
-  // Poll backend connection and fetch run history
-  useEffect(() => {
-    fetchRuns();
-    const interval = setInterval(fetchRuns, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Poll active run details when executing or in runner view to keep states synchronized
-  useEffect(() => {
-    let interval;
-    if (currentRunId && activeTab === 'runner') {
-      interval = setInterval(() => {
-        loadRunDetails(currentRunId);
-      }, 3000);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [currentRunId, activeTab]);
-
-  // Auto-scroll console
-  useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [consoleLogs]);
-
-  // Auto-scroll Agent Feed
-  useEffect(() => {
-    if (agentFeedEndRef.current) {
-      agentFeedEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [agentLogs]);
-
-  // Log execution state changes to the Agent Live Feed
-  useEffect(() => {
-    if (!currentRunId) return;
-    if (isExecuting) {
-      addAgentLog('Safety Guardrail pipeline started. Scanning commands...', 'system');
-    } else {
-      if (approvalStep) {
-        addAgentLog('Pipeline BLOCKED: Awaiting manual operator bypass signature.', 'danger');
-      } else {
-        const hasPending = currentRun?.steps.some(s => s.status === 'PENDING');
-        if (hasPending) {
-          addAgentLog('[PAUSED] Safety Guardrail pipeline paused. Waiting for operator dispatch.', 'warning');
-        }
-      }
-    }
-  }, [isExecuting, currentRunId]);
-
-  // Reactive auto-runner pipeline loop
-  useEffect(() => {
-    let timer;
-    if (isExecuting && currentRun) {
-      const nextPending = currentRun.steps.find(s => s.status === 'PENDING');
-      const hasWaiting = currentRun.steps.some(s => s.status === 'WAITING_APPROVAL');
-      const isRunRunning = currentRun.run.status === 'RUNNING' || currentRun.run.status === 'PENDING';
-
-      if (hasWaiting) {
-        if (agentMode === 'SIMULATION') {
-          const waitingStep = currentRun.steps.find(s => s.status === 'WAITING_APPROVAL');
-          if (waitingStep) {
-            timer = setTimeout(() => {
-              addAgentLog(`[Simulation Bypass] Auto-approving risky command Step ${waitingStep.step_number}.`, 'warning');
-              handleApprove();
-            }, analysisDelay);
-          }
-        } else {
-          setIsExecuting(false);
-        }
-      } else if (nextPending) {
-        timer = setTimeout(() => {
-          runNextStep();
-        }, analysisDelay);
-      } else if (isRunRunning) {
-        timer = setTimeout(() => {
-          runNextStep();
-        }, analysisDelay);
-      }
-    }
-    return () => clearTimeout(timer);
-  }, [isExecuting, currentRun, agentMode, analysisDelay]);
 
   const fetchRuns = async () => {
     try {
@@ -309,6 +204,53 @@ function App() {
     }
   };
 
+  const handleDownloadCSV = () => {
+    if (!auditRunDetails) return;
+    
+    const headers = [
+      'Step Number',
+      'Description',
+      'Command',
+      'Type',
+      'Risk Level',
+      'Status',
+      'Output',
+      'Corrected Command',
+      'Executed At'
+    ];
+    
+    const rows = auditRunDetails.steps.map(step => [
+      step.step_number,
+      step.description || '',
+      step.command || '',
+      step.step_type || 'SHELL',
+      step.risk_level || 'SAFE',
+      step.status || 'PENDING',
+      step.output || '',
+      step.corrected_command || '',
+      step.executed_at ? new Date(step.executed_at).toLocaleString() : ''
+    ]);
+    
+    const csvContent = [
+      headers.map(escapeCSV).join(','),
+      ...rows.map(row => row.map(escapeCSV).join(','))
+    ].join('\n');
+    
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    
+    const cleanName = auditRunDetails.run.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    link.href = url;
+    link.setAttribute('download', `runbook_report_Run_${auditRunDetails.run.id}_${cleanName}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    
+    triggerToast('CSV report downloaded successfully.', 'success');
+  };
+
   const handleUpload = async (e) => {
     if (e) e.preventDefault();
 
@@ -324,6 +266,8 @@ function App() {
     } else {
       formData.append('runbook_markdown', uploadText);
     }
+
+    setIsUploading(true);
 
     try {
       const res = await fetch(`${API_BASE}/api/upload`, {
@@ -353,7 +297,22 @@ function App() {
     } catch (err) {
       console.error(err);
       triggerToast('Connection to backend failed.', 'error');
+    } finally {
+      setIsUploading(false);
     }
+  };
+
+  const handleLoadEdgeCase = () => {
+    setUploadName('Edge Case Runbook');
+    setUploadText(`# Edge Case Runbook
+
+1. Check disk space (This step should succeed): \`df -h\`
+2. Test non-existent shell command (This step should fail with command not found): \`invalid-command-xyz --args\`
+3. Database diagnostics with RUNBOOK table (This query will return runbook records): \`SQL: SELECT * FROM RUNBOOK;\`
+4. Querying a broken REST API endpoint (This REST step will fail): \`GET http://localhost:9999/api/broken-endpoint\`
+5. Print final message (Fallback step): \`echo "Error testing completed"\``);
+    setUploadFile(null);
+    triggerToast('Loaded Edge Case Runbook template into editor.', 'success');
   };
 
   const runNextStep = async () => {
@@ -416,8 +375,8 @@ function App() {
         const step = data.step;
         setConsoleLogs(prev => [
           ...prev,
-          { type: 'system', text: `[MCP RECOVERY] Command successfully swapped!` },
-          { type: 'input', text: step.command },
+          { type: 'system', text: `[MCP RECOVERY] Command successfully swapped for Step ${step.step_number}!` },
+          { type: 'corrected', text: step.corrected_command || step.command },
           { type: 'output', text: step.output || 'Recovered.' }
         ]);
         addAgentLog(`Step ${step.step_number} successfully auto-recovered via MCP.`, 'check');
@@ -454,6 +413,7 @@ function App() {
         addAgentLog(`Audit safety summary generated.`, 'system');
         triggerToast('Runbook execution finished!', 'success');
         fetchRuns();
+        loadAuditDetails(currentRunId);
       }
     } catch (err) {
       console.error(err);
@@ -592,6 +552,130 @@ function App() {
     const completed = currentRun.steps.filter(s => ['SUCCESS', 'FAILED', 'DENIED'].includes(s.status)).length;
     return Math.round((completed / total) * 100);
   };
+
+  // Restore run state from localStorage on startup — validate the run still exists first
+  useEffect(() => {
+    const savedRunId = localStorage.getItem('antigravity_current_run_id');
+    if (savedRunId) {
+      const runId = parseInt(savedRunId, 10);
+      // Validate the run still exists before restoring
+      fetch(`${API_BASE}/api/run/${runId}/status`)
+        .then(res => {
+          if (!res.ok) throw new Error('Run not found');
+          return res.json();
+        })
+        .then(data => {
+          setCurrentRunId(runId);
+          setCurrentRun(data);
+          setActiveTab('runner');
+          setConsoleLogs([{ type: 'system', text: `[SYSTEM] Restored runner state from last session (Run ID: ${runId}).` }]);
+          triggerToast('Restored last active session.', 'info');
+        })
+        .catch(() => {
+          // Run no longer exists — clear stale localStorage silently
+          localStorage.removeItem('antigravity_current_run_id');
+          setActiveTab('dashboard');
+        });
+    }
+  }, []);
+
+  // Sync currentRunId to localStorage
+  useEffect(() => {
+    if (currentRunId) {
+      localStorage.setItem('antigravity_current_run_id', currentRunId);
+    } else {
+      localStorage.removeItem('antigravity_current_run_id');
+    }
+  }, [currentRunId]);
+
+  // Poll backend connection and fetch run history
+  useEffect(() => {
+    Promise.resolve().then(() => fetchRuns());
+    const interval = setInterval(() => {
+      Promise.resolve().then(() => fetchRuns());
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Poll active run details when executing or in runner view to keep states synchronized
+  useEffect(() => {
+    let interval;
+    if (currentRunId && activeTab === 'runner') {
+      interval = setInterval(() => {
+        loadRunDetails(currentRunId);
+      }, 3000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentRunId, activeTab]);
+
+  // Auto-scroll console
+  useEffect(() => {
+    if (consoleEndRef.current) {
+      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [consoleLogs]);
+
+  // Auto-scroll Agent Feed
+  useEffect(() => {
+    if (agentFeedEndRef.current) {
+      agentFeedEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [agentLogs]);
+
+  // Log execution state changes to the Agent Live Feed
+  useEffect(() => {
+    if (!currentRunId) return;
+    if (isExecuting) {
+      Promise.resolve().then(() => addAgentLog('Safety Guardrail pipeline started. Scanning commands...', 'system'));
+    } else {
+      if (approvalStep) {
+        Promise.resolve().then(() => addAgentLog('Pipeline BLOCKED: Awaiting manual operator bypass signature.', 'danger'));
+      } else {
+        const hasPending = currentRun?.steps.some(s => s.status === 'PENDING');
+        if (hasPending) {
+          Promise.resolve().then(() => addAgentLog('[PAUSED] Safety Guardrail pipeline paused. Waiting for operator dispatch.', 'warning'));
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isExecuting, currentRunId]);
+
+  // Reactive auto-runner pipeline loop
+  useEffect(() => {
+    let timer;
+    if (isExecuting && currentRun) {
+      const nextPending = currentRun.steps.find(s => s.status === 'PENDING');
+      const hasWaiting = currentRun.steps.some(s => s.status === 'WAITING_APPROVAL');
+      const isRunRunning = currentRun.run.status === 'RUNNING' || currentRun.run.status === 'PENDING';
+
+      if (hasWaiting) {
+        if (agentMode === 'SIMULATION') {
+          const waitingStep = currentRun.steps.find(s => s.status === 'WAITING_APPROVAL');
+          if (waitingStep) {
+            timer = setTimeout(() => {
+              addAgentLog(`[Simulation Bypass] Auto-approving risky command Step ${waitingStep.step_number}.`, 'warning');
+              handleApprove();
+            }, analysisDelay);
+          }
+        } else {
+          Promise.resolve().then(() => setIsExecuting(false));
+        }
+      } else if (nextPending) {
+        timer = setTimeout(() => {
+          runNextStep();
+        }, analysisDelay);
+      } else if (isRunRunning) {
+        timer = setTimeout(() => {
+          runNextStep();
+        }, analysisDelay);
+      }
+    }
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isExecuting, currentRun, agentMode, analysisDelay]);
 
   const activeProgress = calculateProgress();
 
@@ -743,9 +827,37 @@ function App() {
                     />
                   </div>
 
-                  <button type="submit" className="btn-primary" disabled={!isBackendConnected}>
-                    Stage & Parse Runbook
-                  </button>
+                  <div style={{ display: 'flex', gap: '12px' }}>
+                    <button type="submit" className="btn-primary" style={{ flexGrow: 1 }} disabled={!isBackendConnected || isUploading}>
+                      {isUploading ? 'Staging...' : 'Stage & Parse Runbook'}
+                    </button>
+                    <button 
+                      type="button" 
+                      onClick={handleLoadEdgeCase}
+                      style={{ 
+                        padding: '12px 24px', 
+                        borderRadius: 'var(--border-radius-sm)', 
+                        fontWeight: '700',
+                        fontSize: '16px',
+                        cursor: 'pointer',
+                        background: 'linear-gradient(135deg, #facc15 0%, #eab308 100%)',
+                        border: 'none',
+                        color: '#050508',
+                        transition: 'var(--transition-smooth)',
+                        boxShadow: '0 4px 12px rgba(234, 179, 8, 0.3)'
+                      }}
+                      onMouseOver={(e) => {
+                        e.currentTarget.style.filter = 'brightness(1.1)';
+                        e.currentTarget.style.boxShadow = '0 6px 16px rgba(234, 179, 8, 0.5)';
+                      }}
+                      onMouseOut={(e) => {
+                        e.currentTarget.style.filter = 'none';
+                        e.currentTarget.style.boxShadow = '0 4px 12px rgba(234, 179, 8, 0.3)';
+                      }}
+                    >
+                      EDGE CASE
+                    </button>
+                  </div>
                 </form>
               </section>
 
@@ -961,11 +1073,69 @@ function App() {
                 {consoleLogs.length === 0 ? (
                   <div className="console-line system">Console is ready. Start execution pipeline.</div>
                 ) : (
-                  consoleLogs.map((log, idx) => (
-                    <div key={idx} className={`console-line ${log.type}`}>
-                      {log.text}
-                    </div>
-                  ))
+                  consoleLogs.map((log, idx) => {
+                    // ── SQL TABLE ────────────────────────────────────────
+                    if (log.type === 'output' || log.type === 'recovered') {
+                      try {
+                        const rawText = log.text.trim();
+                        const jsonStart = rawText.indexOf('{');
+                        const jsonText = jsonStart >= 0 ? rawText.slice(jsonStart) : rawText;
+                        const parsed = JSON.parse(jsonText);
+                        if (parsed && parsed.__type === 'SQL_TABLE') {
+                          return (
+                            <div key={idx} className="sql-table-wrapper">
+                              <div className="sql-table-header">
+                                <span>🗄️</span>
+                                <span>DB QUERY — {parsed.row_count} row(s) returned</span>
+                                <span style={{ opacity: 0.6, fontWeight: 400, marginLeft: 'auto' }}>{parsed.sql}</span>
+                              </div>
+                              <div style={{ overflowX: 'auto' }}>
+                                <table className="sql-result-table">
+                                  <thead>
+                                    <tr>
+                                      {parsed.columns.map((col, ci) => (
+                                        <th key={ci}>{col}</th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {parsed.rows.map((row, ri) => (
+                                      <tr key={ri}>
+                                        {row.map((cell, ci) => (
+                                          <td key={ci}>
+                                            {(cell === 'None' || cell === '' || cell === null)
+                                              ? <span className="sql-null-value">NULL</span>
+                                              : cell}
+                                          </td>
+                                        ))}
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          );
+                        }
+                      } catch (_) { /* not JSON – fall through to normal render */ }
+                    }
+
+                    // ── CORRECTED COMMAND ─────────────────────────────────
+                    if (log.type === 'corrected') {
+                      return (
+                        <div key={idx} className="corrected-cmd-block">
+                          <span style={{ fontWeight: 700 }}>🔧 CORRECTED:</span>
+                          <span>{log.text}</span>
+                        </div>
+                      );
+                    }
+
+                    // ── NORMAL LOG LINE ───────────────────────────────────
+                    return (
+                      <div key={idx} className={`console-line ${log.type}`}>
+                        {log.text}
+                      </div>
+                    );
+                  })
                 )}
                 <div ref={consoleEndRef} />
               </div>
@@ -1131,9 +1301,30 @@ function App() {
                       {auditRunDetails.run.completed_at && ` • Ended: ${new Date(auditRunDetails.run.completed_at).toLocaleString()}`}
                     </p>
                   </div>
-                  <span className={`badge ${auditRunDetails.run.status.toLowerCase()}`} style={{ fontSize: '14px', padding: '6px 12px' }}>
-                    {auditRunDetails.run.status}
-                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <button 
+                      className="btn-primary" 
+                      onClick={handleDownloadCSV} 
+                      style={{ 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        gap: '6px', 
+                        padding: '6px 12px', 
+                        fontSize: '13px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                      </svg>
+                      Download CSV
+                    </button>
+                    <span className={`badge ${auditRunDetails.run.status.toLowerCase()}`} style={{ fontSize: '14px', padding: '6px 12px' }}>
+                      {auditRunDetails.run.status}
+                    </span>
+                  </div>
                 </div>
 
                 {/* AI generated audit report */}
@@ -1218,16 +1409,76 @@ function App() {
                                     )}
                                   </div>
                                   {step.corrected_command && (
-                                    <div style={{ borderLeft: '3px solid var(--color-success)', background: 'rgba(16, 185, 129, 0.05)', padding: '10px 14px', borderRadius: '4px' }}>
-                                      <h4 style={{ fontSize: '13px', textTransform: 'uppercase', color: 'var(--color-success)', margin: '0 0 6px 0', fontWeight: 'bold' }}>Corrected Command / Action Suggestion</h4>
-                                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '14px', whiteSpace: 'pre-wrap', color: 'var(--color-text-primary)' }}>
+                                    <div style={{ borderLeft: '3px solid var(--color-success)', background: 'rgba(16, 185, 129, 0.05)', padding: '12px 16px', borderRadius: '6px' }}>
+                                      <h4 style={{ fontSize: '12px', textTransform: 'uppercase', color: 'var(--color-success)', margin: '0 0 8px 0', fontWeight: 800, letterSpacing: '0.5px' }}>
+                                        🔧 Auto-Corrected Command
+                                      </h4>
+                                      <div style={{
+                                        fontFamily: 'var(--font-mono)',
+                                        fontSize: '13px',
+                                        background: 'rgba(0,0,0,0.35)',
+                                        border: '1px solid rgba(16,185,129,0.2)',
+                                        borderRadius: '5px',
+                                        padding: '9px 14px',
+                                        color: '#6ee7b7',
+                                        wordBreak: 'break-all',
+                                        whiteSpace: 'pre-wrap'
+                                      }}>
                                         {step.corrected_command}
                                       </div>
                                     </div>
                                   )}
                                   <div>
                                     <h4 style={{ fontSize: '13px', textTransform: 'uppercase', color: 'var(--color-text-secondary)', marginBottom: '4px' }}>Terminal Stdout / Output</h4>
-                                    <div className="output-box">{step.output || 'No output recorded.'}</div>
+                                    <div className="output-box" style={{ padding: step.step_type === 'DB_QUERY' ? '0' : undefined, background: step.step_type === 'DB_QUERY' ? 'transparent' : undefined }}>
+                                      {(() => {
+                                        if (step.step_type === 'DB_QUERY' && step.output) {
+                                          try {
+                                            // Strip any MCP prefix lines before JSON parsing
+                                            const rawOutput = step.output.trim();
+                                            const jsonStart = rawOutput.indexOf('{');
+                                            const jsonText = jsonStart >= 0 ? rawOutput.slice(jsonStart) : rawOutput;
+                                            const parsed = JSON.parse(jsonText);
+                                            if (parsed && parsed.__type === 'SQL_TABLE') {
+                                              return (
+                                                <div className="sql-table-wrapper" style={{ margin: 0, border: '1px solid rgba(99,102,241,0.25)', borderRadius: '8px' }}>
+                                                  <div className="sql-table-header">
+                                                    <span>🗄️</span>
+                                                    <span>DB QUERY — {parsed.row_count} row(s) returned</span>
+                                                    <span style={{ opacity: 0.6, fontWeight: 400, marginLeft: 'auto' }}>{parsed.sql}</span>
+                                                  </div>
+                                                  <div style={{ overflowX: 'auto' }}>
+                                                    <table className="sql-result-table">
+                                                      <thead>
+                                                        <tr>
+                                                          {parsed.columns.map((col, ci) => (
+                                                            <th key={ci}>{col}</th>
+                                                          ))}
+                                                        </tr>
+                                                      </thead>
+                                                      <tbody>
+                                                        {parsed.rows.map((row, ri) => (
+                                                          <tr key={ri}>
+                                                            {row.map((cell, ci) => (
+                                                              <td key={ci}>
+                                                                {(cell === 'None' || cell === '' || cell === null)
+                                                                  ? <span className="sql-null-value">NULL</span>
+                                                                  : cell}
+                                                              </td>
+                                                            ))}
+                                                          </tr>
+                                                        ))}
+                                                      </tbody>
+                                                    </table>
+                                                  </div>
+                                                </div>
+                                              );
+                                            }
+                                          } catch (_) {}
+                                        }
+                                        return step.output || 'No output recorded.';
+                                      })()}
+                                    </div>
                                   </div>
                                 </>
                               )}
@@ -1278,7 +1529,7 @@ function App() {
 
             <div className="warning-details">
               <h5>Safety Model Classification</h5>
-              <p>{approvalStep.explanation || 'Risky command pattern matching standard blacklist/restricted binary rules.'}</p>
+              <p>{approvalWarning || approvalStep.explanation || 'Risky command pattern matching standard blacklist/restricted binary rules.'}</p>
               {approvalStep.recommendation && (
                 <p style={{ marginTop: '8px', borderTop: '1px solid rgba(255, 142, 60, 0.1)', paddingTop: '8px', fontSize: '13px' }}>
                   <strong>Recommendation:</strong> {approvalStep.recommendation}

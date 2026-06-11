@@ -32,3 +32,4 @@ frontend/*.log
 # IDE
 .vscode/
 .idea/
+backend/antigravity.db*

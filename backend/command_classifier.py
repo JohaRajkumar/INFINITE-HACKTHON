@@ -56,7 +56,7 @@ Respond ONLY in this exact JSON format, no extra text:
                 "format": "json"
             }
             
-            response = requests.post(f"{ollama_url}/api/generate", json=payload, headers=headers, timeout=10)
+            response = requests.post(f"{ollama_url}/api/generate", json=payload, headers=headers, timeout=3)
             if response.status_code == 200:
                 res_data = response.json()
                 raw_response = res_data.get("response", "").strip()
@@ -68,7 +68,8 @@ Respond ONLY in this exact JSON format, no extra text:
                     result["safe"] = bool(result["safe"])
                     return result
         except Exception as e:
-            print(f"Ollama classification failed: {e}. Falling back to rule-based classifier.")
+            print(f"Ollama classification failed: {e}. Falling back to rule-based classifier and disabling Ollama globally.")
+            Config.MOCK_OLLAMA = True
 
     return _classify_command_fallback(command)
 
@@ -257,62 +258,192 @@ def _generate_warning_fallback(command, risk_level):
             "Verify the command arguments carefully before confirming execution."
         )
 
+
+def _get_db_schema():
+    """
+    Reads the live SQLite database and returns a dict of {table_name: [columns]}.
+    """
+    try:
+        from config import Config as _Config
+        from sqlalchemy import create_engine, text as sa_text
+        _engine = create_engine(
+            _Config.DB_QUERY_URL,
+            connect_args={"check_same_thread": False} if "sqlite" in _Config.DB_QUERY_URL else {}
+        )
+        schema = {}
+        with _engine.connect() as conn:
+            tables = conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")).fetchall()
+            for (tname,) in tables:
+                cols = conn.execute(sa_text(f"PRAGMA table_info(\"{tname}\");")).fetchall()
+                schema[tname] = [c[1] for c in cols]
+        return schema
+    except Exception as e:
+        print(f"[Schema Introspection Error] {e}")
+        return {}
+
+
+def _build_schema_hint(schema):
+    """Returns a human-readable schema string for prompt injection."""
+    lines = []
+    for table, cols in schema.items():
+        lines.append(f"  Table: {table}  Columns: {', '.join(cols)}")
+    return "\n".join(lines) if lines else "  (no tables found)"
+
+
+def _smart_sql_fix(broken_command, error_output, schema):
+    """
+    Rule-based smart fixer: tries to guess the correct table/columns
+    from the actual live DB schema based on the broken query.
+    """
+    import re
+    lower_err = error_output.lower()
+    lower_cmd = broken_command.lower()
+
+    # Extract the raw SQL from the "SQL: ..." prefix
+    raw_sql = re.sub(r"^SQL:\s*", "", broken_command.strip(), flags=re.IGNORECASE).strip()
+
+    if not schema:
+        return f"`SQL: SELECT name FROM sqlite_master WHERE type='table';`\nExplanation: Could not read the live schema. Listing all tables instead."
+
+    # ── 1. Table not found: try to find the closest matching table ──────────
+    if "no such table" in lower_err or "does not exist" in lower_err:
+        # Extract the table name referenced in the broken query (after FROM or INTO etc.)
+        table_match = re.search(r"\bfrom\s+([`\"\[]?[\w]+[`\"\]]?)", raw_sql, re.IGNORECASE)
+        broken_table = table_match.group(1).strip('`"[]') if table_match else ""
+
+        # Find best match in real schema by substring similarity
+        best_match = None
+        best_score = 0
+        broken_lower = broken_table.lower()
+        for real_table in schema.keys():
+            # Simple scoring: how many chars of broken_table appear in real_table
+            score = sum(1 for c in broken_lower if c in real_table.lower())
+            if score > best_score:
+                best_score = score
+                best_match = real_table
+
+        if best_match:
+            # Re-build query with corrected table name
+            corrected_sql = re.sub(
+                r'\b' + re.escape(broken_table) + r'\b',
+                best_match,
+                raw_sql,
+                flags=re.IGNORECASE
+            )
+            cols_hint = ", ".join(schema[best_match][:6])
+            return (
+                f"`SQL: {corrected_sql}`\n"
+                f"Explanation: Table '{broken_table}' not found. Replaced with closest match '{best_match}'. "
+                f"Available columns: {cols_hint}."
+            )
+
+    # ── 2. Column not found: suggest SELECT * or correct columns ────────────
+    if "no such column" in lower_err:
+        col_match = re.search(r"no such column:\s*(\S+)", lower_err)
+        broken_col = col_match.group(1).strip('`"') if col_match else ""
+        # Find which table the query is on
+        table_match = re.search(r"\bfrom\s+([`\"\[]?[\w]+[`\"\]]?)", raw_sql, re.IGNORECASE)
+        table_name = table_match.group(1).strip('`"[]') if table_match else ""
+        if table_name in schema:
+            real_cols = schema[table_name]
+            corrected_sql = re.sub(
+                r'\b' + re.escape(broken_col) + r'\b',
+                real_cols[0] if real_cols else '*',
+                raw_sql,
+                flags=re.IGNORECASE
+            )
+            return (
+                f"`SQL: {corrected_sql}`\n"
+                f"Explanation: Column '{broken_col}' not found in '{table_name}'. "
+                f"Valid columns are: {', '.join(real_cols)}."
+            )
+
+    # ── 3. Syntax error: return prettified version ──────────────────────────
+    if "syntax error" in lower_err:
+        # Suggest listing schema
+        table_list = ", ".join(schema.keys())
+        return (
+            f"`SQL: SELECT name FROM sqlite_master WHERE type='table';`\n"
+            f"Explanation: Syntax error in query. Available tables: {table_list}. Please check your SQL syntax."
+        )
+
+    # ── 4. Generic fallback: show all tables ────────────────────────────────
+    table_list = ", ".join(schema.keys())
+    return (
+        f"`SQL: SELECT name FROM sqlite_master WHERE type='table';`\n"
+        f"Explanation: Query failed. Available tables in this database: {table_list}."
+    )
+
+
 def suggest_corrected_command(command, step_type, error_output):
     """
     Given a failed command, its type, and its error output, suggest a corrected version
-    of the command or SQL query using Ollama (or simple rule-based fallback).
+    of the command or SQL query using Ollama (with live schema awareness), or smart rule-based fallback.
     """
     mock_ollama = Config.MOCK_OLLAMA
     ollama_url = Config.OLLAMA_API_URL
     model = Config.OLLAMA_MODEL
 
+    # For SQL: always load the live schema first (used in prompt + fallback)
+    schema = {}
+    schema_hint = ""
+    if step_type == "DB_QUERY":
+        schema = _get_db_schema()
+        schema_hint = _build_schema_hint(schema)
+
     if not mock_ollama:
         try:
-            prompt = f"""You are ANTIGRAVITY, a DevOps AI coding and database assistant.
-We executed this command/query and it failed:
+            if step_type == "DB_QUERY":
+                prompt = f"""You are ANTIGRAVITY, a DevOps database assistant.
+A SQL query failed. Your job is to produce the corrected, working SQL query.
+
+Failed Command: `{command}`
+Error Output:
+{error_output}
+
+LIVE DATABASE SCHEMA (use ONLY these exact table/column names):
+{schema_hint}
+
+Rules:
+- The corrected query MUST use only table and column names from the schema above.
+- The corrected query MUST start with 'SQL:'.
+- Respond ONLY with the corrected command in backticks, then a 1-sentence explanation.
+
+Example format:
+`SQL: SELECT * FROM RUNBOOK;`
+Explanation: Corrected table name from 'runbook_runs' to 'RUNBOOK'.
+"""
+            else:
+                prompt = f"""You are ANTIGRAVITY, a DevOps AI assistant.
+We executed this command and it failed:
 Command Type: {step_type}
 Failed Command: `{command}`
 Error Output:
 {error_output}
 
-Please provide the corrected command or query that will run successfully.
-If it is a database query (DB_QUERY), it MUST start with 'SQL:'.
-Respond with ONLY the corrected command line in backticks, with a very brief 1-sentence explanation below it.
-Example response format:
-`SQL: SELECT * FROM runbook_runs;`
-Explanation: Fixed the table name from runs to runbook_runs.
+Please provide the corrected command that will run successfully.
+Respond with ONLY the corrected command in backticks, with a very brief 1-sentence explanation below it.
 """
             headers = {"Content-Type": "application/json"}
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "stream": False
-            }
+            payload = {"model": model, "prompt": prompt, "stream": False}
             response = requests.post(f"{ollama_url}/api/generate", json=payload, headers=headers, timeout=10)
             if response.status_code == 200:
-                res_data = response.json()
-                correction_text = res_data.get("response", "").strip()
+                correction_text = response.json().get("response", "").strip()
                 if correction_text:
                     return correction_text
         except Exception as e:
-            print(f"Ollama correction suggestion failed: {e}. Falling back.")
+            print(f"Ollama correction suggestion failed: {e}. Using smart rule-based fallback.")
+            Config.MOCK_OLLAMA = True
 
-    # Rule-based fallback
+    # ── Smart rule-based fallback ────────────────────────────────────────────
     lower_cmd = command.lower()
     lower_err = error_output.lower()
 
     if step_type == "DB_QUERY":
-        if "no such table" in lower_err or "does not exist" in lower_err or "non_existent_table" in lower_cmd:
-            if "runbook_runs" in lower_err or "runs" in lower_cmd:
-                return "`SQL: SELECT * FROM runbook_runs;`\nExplanation: Corrected the table name to existing table 'runbook_runs'."
-            elif "runbook_steps" in lower_err or "steps" in lower_cmd:
-                return "`SQL: SELECT * FROM runbook_steps;`\nExplanation: Corrected the table name to existing table 'runbook_steps'."
-            else:
-                return "`SQL: SELECT name FROM sqlite_master WHERE type='table';`\nExplanation: Substituted the query to list all existing tables to help you find the correct name."
-        return f"`SQL: {command}`\nExplanation: Please verify that all database credentials, table schemas, and SQL syntax rules are satisfied."
+        return _smart_sql_fix(command, error_output, schema)
 
     elif step_type == "REST_API":
-        return f"`GET http://localhost:5050/api/runs`\nExplanation: Substituted the target URL to the active backend status endpoint (port 5050) as the requested endpoint was unreachable."
+        return "`GET http://localhost:5050/api/runs`\nExplanation: Substituted with the active backend status endpoint (port 5050) as the requested endpoint was unreachable."
 
     else:
         # SHELL / BASH
@@ -320,5 +451,4 @@ Explanation: Fixed the table name from runs to runbook_runs.
             if "invalid-command" in lower_cmd:
                 return "`echo 'Corrected test command'`\nExplanation: Replaced the unrecognized command with a standard safe shell echo output."
             return "`echo 'Fixed command execution'`\nExplanation: Substituted standard echo verification output for the missing/unrecognized tool."
-        return f"`ls`\nExplanation: Replaced with safe list command as verification."
-
+        return "`ls`\nExplanation: Replaced with safe list command as verification."

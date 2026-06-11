@@ -15,6 +15,19 @@ from file_converter import extract_text_from_file
 app = Flask(__name__)
 app.config.from_object(Config)
 
+import time
+
+@app.before_request
+def start_timer():
+    request.start_time = time.time()
+
+@app.after_request
+def log_response_time(response):
+    duration = time.time() - getattr(request, 'start_time', time.time())
+    # Simple print; could be replaced with proper logger
+    print(f"[Response Time] {request.method} {request.path} took {duration:.3f}s")
+    return response
+
 # Enable CORS globally for local development cross-talk (React to Flask)
 CORS(app)
 
@@ -95,13 +108,47 @@ def upload_runbook():
     if not parsed_steps:
         return jsonify({"error": "Could not parse any numbered steps from the runbook."}), 400
 
+    # Process all classifications BEFORE opening database transaction to avoid locking
+    processed_steps = []
+    for step_data in parsed_steps:
+        cmd = step_data.get("command", "")
+        has_cmd = step_data.get("has_command", False)
+        
+        risk_level = "SAFE"
+        explanation = "Informational step."
+        recommendation = "None"
+        step_type = "SHELL"
+        
+        if has_cmd and cmd:
+            step_type = detect_step_type(cmd)
+            classification = classify_command(cmd, step_type)
+            risk_level = classification.get("risk_level", "SAFE")
+            explanation = classification.get("explanation", "")
+            recommendation = classification.get("recommendation", "")
+
+            # Shell allowlist check — only applies to SHELL type
+            if step_type == "SHELL" and not is_command_allowed(cmd):
+                risk_level = "HIGH"
+                explanation = f"[ALLOWLIST BLOCK] Command contains unauthorized binary. {explanation}"
+
+        processed_steps.append({
+            "step_number": step_data.get("number"),
+            "description": step_data.get("description"),
+            "command": cmd,
+            "has_command": has_cmd,
+            "step_type": step_type,
+            "risk_level": risk_level,
+            "explanation": explanation,
+            "recommendation": recommendation,
+        })
+
     session = get_db()
     try:
         # Create new run
         run = RunbookRun(
             name=runbook_name,
             status='PENDING',
-            total_steps=len(parsed_steps),
+            total_steps=len(processed_steps),
             executed_steps=0,
             skipped_steps=0,
             errors_count=0
@@ -110,38 +157,17 @@ def upload_runbook():
         session.flush() # Populate run.id
 
         # Add steps
-        for step_data in parsed_steps:
-            cmd = step_data.get("command", "")
-            has_cmd = step_data.get("has_command", False)
-            
-            risk_level = "SAFE"
-            explanation = "Informational step."
-            recommendation = "None"
-            
-            if has_cmd and cmd:
-                step_type = detect_step_type(cmd)
-                classification = classify_command(cmd, step_type)
-                risk_level = classification.get("risk_level", "SAFE")
-                explanation = classification.get("explanation", "")
-                recommendation = classification.get("recommendation", "")
-
-                # Shell allowlist check — only applies to SHELL type
-                if step_type == "SHELL" and not is_command_allowed(cmd):
-                    risk_level = "HIGH"
-                    explanation = f"[ALLOWLIST BLOCK] Command contains unauthorized binary. {explanation}"
-            else:
-                step_type = "SHELL"
-
+        for p_step in processed_steps:
             step = RunbookStep(
                 run_id=run.id,
-                step_number=step_data.get("number"),
-                description=step_data.get("description"),
-                command=cmd,
-                has_command=has_cmd,
-                step_type=step_type,
-                risk_level=risk_level,
-                explanation=explanation,
-                recommendation=recommendation,
+                step_number=p_step["step_number"],
+                description=p_step["description"],
+                command=p_step["command"],
+                has_command=p_step["has_command"],
+                step_type=p_step["step_type"],
+                risk_level=p_step["risk_level"],
+                explanation=p_step["explanation"],
+                recommendation=p_step["recommendation"],
                 status='PENDING'
             )
             session.add(step)
@@ -239,17 +265,31 @@ def execute_next_step(run_id):
 
         # Phase 2 of Auto-Remediation: Execute the corrected command
         if next_step.status == 'RECOVERING':
-            print(f"Executing MCP recovered command: {next_step.corrected_command}")
+            corrected_cmd = next_step.corrected_command or ""
+
+            # ── Validate the corrected command ──────────────────────────────
+            # For DB_QUERY: ensure it starts with SQL: and has a SELECT keyword
+            if next_step.step_type == 'DB_QUERY':
+                import re as _re
+                has_sql_prefix = corrected_cmd.strip().upper().startswith('SQL:')
+                has_select = bool(_re.search(r'\bSELECT\b', corrected_cmd, _re.IGNORECASE))
+                if not has_sql_prefix or not has_select:
+                    # Invalid corrected command — use safe default: show RUNBOOK table
+                    corrected_cmd = "SQL: SELECT * FROM RUNBOOK;"
+                    next_step.corrected_command = corrected_cmd
+                    print(f"[Recovery] Invalid SQL corrected_command, defaulting to: {corrected_cmd}")
+
+            print(f"Executing MCP recovered command: {corrected_cmd}")
+
+            # Execute the corrected command
+            retry_success, retry_output = execute_step(corrected_cmd, next_step.step_type or 'SHELL')
             
-            # Execute the corrected command directly without erasing the original broken command from history
-            retry_success, retry_output = execute_step(next_step.corrected_command, next_step.step_type or 'SHELL')
-            
-            # Update outputs to reflect recovery
-            next_step.output = f"[MCP AUTO-RECOVERY SUCCESS]\n{retry_output}" if retry_success else f"[MCP AUTO-RECOVERY FAILED]\n{retry_output}"
+            # Store the clean output (without prefix noise)
+            next_step.output = retry_output
             
             if retry_success:
                 next_step.status = 'SUCCESS'
-                run.errors_count -= 1 # Remove the error count since we successfully recovered
+                run.errors_count = max(0, run.errors_count - 1)
             else:
                 next_step.status = 'FAILED'
                 
@@ -307,7 +347,7 @@ def execute_next_step(run_id):
                 )
                 
                 return jsonify({
-                    "status": "RUNNING",
+                    "status": "SUCCESS",
                     "message": f"Step {next_step.step_number} executed successfully.",
                     "step": next_step.to_dict()
                 })

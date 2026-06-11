@@ -153,7 +153,7 @@ class TestAntigravityAgent(unittest.TestCase):
         self.assertEqual(steps[0]["command"], "df -h")
         self.assertEqual(steps[0]["step_type"], "SHELL")
         
-        self.assertEqual(steps[1]["command"], "SQL: SELECT count(*) FROM runbook_runs;")
+        self.assertEqual(steps[1]["command"], "SQL: SELECT count(*) FROM RUNBOOK;")
         self.assertEqual(steps[1]["step_type"], "DB_QUERY")
         
         self.assertEqual(steps[2]["command"], "systemctl restart nginx")

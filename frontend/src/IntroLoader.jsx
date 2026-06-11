@@ -1,15 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import IntroTransition from './IntroTransition';
 
 /**
- * IntroLoader – handles the timing/stage logic.
+ * IntroLoader – handles the stage logic.
  * The visual rendering is delegated to IntroTransition.
  */
 export default function IntroLoader({ onComplete }) {
   const [stage, setStage] = useState('welcome'); // welcome -> scan -> complete -> exit
 
   useEffect(() => {
-    // Stage 1: Welcome message
+    // Stage 2: Safety scanning simulated visual effect
     const welcomeTimer = setTimeout(() => {
       setStage('scan');
     }, 1200);
@@ -35,6 +35,7 @@ export default function IntroLoader({ onComplete }) {
       clearTimeout(completeTimer);
       clearTimeout(exitTimer);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Run only once on mount to avoid re-triggering on App re-renders
 
   return <IntroTransition stage={stage} />;

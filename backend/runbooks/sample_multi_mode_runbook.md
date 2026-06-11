@@ -20,7 +20,7 @@
 
 ## 3. Database Diagnostics (DB_QUERY)
 
-5. Inspect recent runs from the SQLite database: `SQL:SELECT id, name, status, total_steps FROM runbook_runs ORDER BY id DESC LIMIT 5;`
+5. Inspect recent runs from the SQLite database: `SQL:SELECT id, name, status, total_steps FROM RUNBOOK ORDER BY id DESC LIMIT 5;`
 6. Count total execution steps logged: `SQL:SELECT COUNT(*) AS total_steps_count FROM runbook_steps;`
 
 ---

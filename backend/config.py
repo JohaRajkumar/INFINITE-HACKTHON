@@ -16,7 +16,7 @@ class Config:
 
     # Ollama Integration
     OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://localhost:11434")
-    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
+    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
     # Set to True to bypass Ollama API requests and use local heuristic parsing/classification fallback
     MOCK_OLLAMA = os.environ.get("MOCK_OLLAMA", "false").lower() == "true"
 

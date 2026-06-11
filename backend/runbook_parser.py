@@ -21,7 +21,7 @@ Given the following Markdown/text runbook content, extract all numbered steps.
 
 For each step:
 1. Identify if the step contains a command (inside backticks or explicitly written).
-2. If the step does NOT contain a command in backticks but describes an executable action in natural language (e.g. "Check the disk space", "Restart nginx daemon", or a Database Query like "Get the count of all staged runs in the database"), you MUST use your Natural Language Processing (NLP) capability to automatically generate the correct SHELL/BASH command (e.g. `df -h`, `systemctl restart nginx`) or SQL query prefixed with 'SQL:' (e.g. `SQL: SELECT count(*) FROM runbook_runs`).
+2. If the step does NOT contain a command in backticks but describes an executable action in natural language (e.g. "Check the disk space", "Restart nginx daemon", or a Database Query like "Get the count of all staged runs in the database"), you MUST use your Natural Language Processing (NLP) capability to automatically generate the correct SHELL/BASH command (e.g. `df -h`, `systemctl restart nginx`) or SQL query prefixed with 'SQL:' (e.g. `SQL: SELECT count(*) FROM RUNBOOK`).
 3. Set has_command to true if a command is either extracted or successfully generated via NLP.
 4. If the step is strictly informational with no actionable operation, set command to an empty string and has_command to false.
 
@@ -102,9 +102,9 @@ def _parse_runbook_fallback(markdown_content):
                 # Check for Database query keywords
                 if "select" in lower_text or "database" in lower_text or "db query" in lower_text or "sql" in lower_text or "query" in lower_text:
                     if "count" in lower_text:
-                        command = "SQL: SELECT count(*) FROM runbook_runs;"
+                        command = "SQL: SELECT count(*) FROM RUNBOOK;"
                     elif "runs" in lower_text:
-                        command = "SQL: SELECT * FROM runbook_runs LIMIT 10;"
+                        command = "SQL: SELECT * FROM RUNBOOK LIMIT 10;"
                     else:
                         command = "SQL: SELECT * FROM sqlite_master WHERE type='table';"
                     has_command = True

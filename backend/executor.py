@@ -220,7 +220,7 @@ def execute_db_query(command):
     """
     Executes a SQL query against the configured database.
     Format:  SQL: SELECT * FROM table
-    Example: SQL: SELECT count(*) FROM runbook_runs
+    Example: SQL: SELECT count(*) FROM RUNBOOK
     Returns: (success_bool, formatted_table_str)
     """
     from sqlalchemy import create_engine, text as sa_text
@@ -257,21 +257,16 @@ def execute_db_query(command):
             if not rows:
                 return True, f"[DB QUERY] Query returned 0 rows.\nSQL: {raw_sql}"
 
-            # Format as ASCII table
-            col_widths = [max(len(str(col)), max((len(str(r[i])) for r in rows), default=0)) for i, col in enumerate(columns)]
-            separator = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
-            header = "|" + "|".join(f" {str(col):<{col_widths[i]}} " for i, col in enumerate(columns)) + "|"
-
-            table_lines = [
-                f"[DB QUERY] {len(rows)} row(s) returned — SQL: {raw_sql}\n",
-                separator, header, separator
-            ]
-            for row in rows:
-                row_str = "|" + "|".join(f" {str(v):<{col_widths[i]}} " for i, v in enumerate(row)) + "|"
-                table_lines.append(row_str)
-            table_lines.append(separator)
-
-            return True, "\n".join(table_lines)
+            # Return structured JSON so the frontend can render a proper HTML table
+            import json as _json
+            structured = {
+                "__type": "SQL_TABLE",
+                "sql": raw_sql,
+                "row_count": len(rows),
+                "columns": columns,
+                "rows": [list(str(v) for v in row) for row in rows]
+            }
+            return True, _json.dumps(structured)
 
     except Exception as e:
         return False, f"[DB ERROR] Query failed: {str(e)}\nSQL: {raw_sql}"
